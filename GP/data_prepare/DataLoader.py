@@ -1,17 +1,12 @@
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from tqdm import tqdm
-from GP.data_prepare.Chem_Graph_Utils import (
-    smiles_or_inchi_to_graph,            # (text, multi_hop_max_dist, ATOM_FEATURES_VOCAB, float_feature_keys, BOND_FEATURES_VOCAB) -> dict or None
-    smiles_or_inchi_to_graph_with_global, # (text, global_cat_idx, global_cont_val, ATOM_FEATURES_VOCAB, float_feature_keys, BOND_FEATURES_VOCAB, multi_hop_max_dist) -> dict or None
-    smiles_or_inchi_to_graphs,
-    smiles_or_inchi_to_graphs_with_global
-)
-# =========================================
-#  문자열 정규화 헬퍼
-# =========================================
+
+# ============================================================
+#  헬퍼: 토큰/용매 문자열 정규화
+# ============================================================
 
 def _normalize_token(x: str) -> str:
     """공백 정리 + Title Case"""
@@ -22,32 +17,31 @@ def _normalize_token(x: str) -> str:
         return ""
     return x.lower().strip().title()
 
+
 def _normalize_solvent_cell(cell: str) -> str:
     """
-    'ethanol + water + ethanol' → 'Ethanol + Water'
-      - 중복 제거
-      - 정렬
-      - Title Case
+    'ethanol + water + ethanol' → 'Ethanol + Water' (중복 제거 / 정렬 / Title Case)
     """
     if cell is None or not isinstance(cell, str):
         return ""
     cell = cell.strip()
     if not cell:
         return ""
+
     toks = [t.strip() for t in cell.split("+") if t.strip()]
     norm = sorted(set(_normalize_token(t) for t in toks if t))
     return " + ".join(norm)
 
 
-# =========================================
-#  Dataset
-# =========================================
+# ============================================================
+#  Dataset 본체
+# ============================================================
 
 class UnifiedSMILESDataset(Dataset):
     """
-    - 한 샘플 = (solute_graph + solvent(or virtual env)_graph)을 하나로 합친 그래프
+    - 한 샘플 = (solute_graph + solvent_graph)을 합친 하나의 그래프
+    - solvent 가 'solid(neat)', 'gas', 'QM' 이면 가상의 환경 그래프(1 노드) 사용
     - global node 사용 X
-    - Solvent 가 'solid(neat)', 'gas', 'QM' 이면 가상의 1-node 환경 그래프 사용
     """
 
     SPECIAL_SOLVENTS = {
@@ -69,25 +63,27 @@ class UnifiedSMILESDataset(Dataset):
         float_feature_keys,
         BOND_FEATURES_VOCAB,
         GLOBAL_FEATURE_VOCABS_dict,
-        x_cat_mode: str = "index",        # "index" | "onehot"
-        global_cat_mode: str = "index",   # "index" | "onehot"
+        x_cat_mode: str = "index",   # "index" | "onehot"
+        global_cat_mode: str = "index",  # "index" | "onehot"
         mol_col: str = "smiles",
         solvent_mol_col: str = "solvent_smiles",
-        mode: str = "cls",                # "cls" | "cls_global_data"
+        mode: str = "cls",  # "cls", "cls_global_data", "cls_global_model"
         max_nodes: int = 128,
         multi_hop_max_dist: int = 5,
-        target_type: str = "exp_spectrum",     # "exp_spectrum"
+        target_type: str = "default",
         intensity_normalize: str = "min_max",
         intensity_range: tuple = (200, 800),
         attn_bias_w: float = 0.0,
+        ex_normalize: str = None,
+        prob_normalize: str = None,
+        nm_dist_mode: str = "hist",
         nm_gauss_sigma: float = 10.0,
         deg_clip_max: int = 5,
     ):
         super().__init__()
 
-        assert mode in ("cls", "cls_global_data")
         self.mode = mode
-        self.is_global = (mode == "cls_global_data")
+        self.is_global = mode in ("cls_global_data", "cls_global_model")
 
         self.nominal_feature_vocab = nominal_feature_vocab
         self.continuous_feature_names = continuous_feature_names
@@ -97,6 +93,9 @@ class UnifiedSMILESDataset(Dataset):
         self.max_nodes = max_nodes
         self.multi_hop_max_dist = multi_hop_max_dist
 
+        self.ex_normalize = ex_normalize
+        self.prob_normalize = prob_normalize
+        self.nm_dist_mode = nm_dist_mode
         self.nm_gauss_sigma = nm_gauss_sigma
 
         self.intensity_normalize = intensity_normalize
@@ -107,7 +106,7 @@ class UnifiedSMILESDataset(Dataset):
         self.solvent_mol_col = solvent_mol_col
         self.data = pd.read_csv(csv_file, low_memory=False)
 
-        # ---------- (A) 명목형 컬럼 정규화 ----------
+        # ------------- (A) 명목형 컬럼 정규화 -------------
         for col in self.nominal_feature_vocab.keys():
             if col in self.data.columns:
                 if col == "Solvent":
@@ -115,7 +114,7 @@ class UnifiedSMILESDataset(Dataset):
                 else:
                     self.data[col] = self.data[col].apply(_normalize_token)
 
-        # Solvent 보조 컬럼 (대표 토큰)
+        # Solvent용 보조 컬럼
         if "Solvent" in self.data.columns:
             self.data["Solvent"] = self.data["Solvent"].apply(_normalize_solvent_cell)
 
@@ -129,7 +128,7 @@ class UnifiedSMILESDataset(Dataset):
                 _pick_primary_token
             )
 
-        # mol_col 자동 추론
+        # mol_col 자동 추론 (없으면)
         if self.mol_col not in self.data.columns:
             if "smiles" in self.data.columns:
                 self.mol_col = "smiles"
@@ -147,13 +146,15 @@ class UnifiedSMILESDataset(Dataset):
         self.x_cat_mode = x_cat_mode
         self.global_cat_mode = global_cat_mode
 
-        # ---------- global_cat: single / multi(예: Solvent) ----------
+        # ---------- global_cat: single vs multi (Solvent etc.) ----------
         cols = list(self.nominal_feature_vocab.keys())
 
         if self.global_cat_mode == "index":
+            # index 모드: 모두 single 취급
             self._global_multi_cols = []
             self._global_single_cols = cols[:]
         else:
+            # onehot 모드: '+' 포함되면 multi 후보
             plus_mask = {
                 c: (
                     c in self.data.columns
@@ -170,6 +171,7 @@ class UnifiedSMILESDataset(Dataset):
                 c for c in cols if c not in self._global_multi_cols
             ]
 
+        # global_cat 메타 (index 기준)
         self.global_cat_feature_order = list(self.nominal_feature_vocab.keys())
         self.global_cat_feature_sizes = [
             len(self.nominal_feature_vocab[n]) for n in self.global_cat_feature_order
@@ -186,78 +188,61 @@ class UnifiedSMILESDataset(Dataset):
         self._validate_columns(csv_file)
         self.data = self.data.loc[:, self._get_all_cols_to_load()]
 
-        # ---------- target 관련 통계 (nm_distribution용) ----------
-        if target_type == "exp_spectrum":
+        # ------------- target 처리 (ex_prob / nm_distribution / exp_spectrum ...) -------------
+        if target_type in ["ex_prob", "nm_distribution"]:
+            ex_data = self.data[[f"ex{i}" for i in range(1, 51)]].values
+            prob_data = self.data[[f"prob{i}" for i in range(1, 51)]].values
+
+            self.global_ex_min = float(np.min(ex_data))
+            self.global_ex_max = float(np.max(ex_data))
+            self.global_ex_mean = float(np.mean(ex_data))
+            self.global_ex_std = float(np.std(ex_data))
+
+            self.global_prob_min = float(np.min(prob_data))
+            self.global_prob_max = float(np.max(prob_data))
+            self.global_prob_mean = float(np.mean(prob_data))
+            self.global_prob_std = float(np.std(prob_data))
+
+        elif target_type == "exp_spectrum":
             nm_min, nm_max = self.intensity_range
             target_cols = [str(i) for i in range(nm_min, nm_max + 1)]
-            existing_cols = [c for c in target_cols if c in self.data.columns]
+            existing_cols = [col for col in target_cols if col in self.data.columns]
             missing_cols = set(target_cols) - set(existing_cols)
-            for c in missing_cols:
-                self.data[c] = 0.0
+            for col in missing_cols:
+                self.data[col] = 0.0
+
         else:
             self.global_ex_min = self.global_ex_max = self.global_ex_mean = self.global_ex_std = None
             self.global_prob_min = self.global_prob_max = self.global_prob_mean = self.global_prob_std = None
 
         self.deg_clip_max = int(deg_clip_max)
 
-        # ---------- targets ----------
+        # targets / masks
         if self.target_type == "exp_spectrum":
             spectrum, mask_tensor = self.process_targets()
-            print("spectrum, mask", spectrum.shape, mask_tensor.shape)
         else:
             spectrum = self.process_targets()
             mask_tensor = None
 
-        # ---------- solute + solvent 그래프 생성 ----------
+        # ------------------------------------------------------------
+        #  Solute + Solvent 그래프 생성 + 병합 (global node 없음)
+        # ------------------------------------------------------------
         self.raw_graphs = []
         valid_indices = []
         expanded_targets = []
         expanded_rows = []
 
-        n_rows = len(self.data)
-        c_ok = 0
-        c_fail_solute_graph = 0
-        c_special_env = 0
-        c_missing_solvent_smiles = 0
-        c_fail_solvent_graph = 0
-        c_fail_merge = 0
-
-        def _detect_env_kind(solvent_name_l: str, solvent_smile_raw):
-            """
-            Solvent 컬럼 + solvent_smiles 컬럼 둘 다에서
-            'solid(neat)', 'gas', 'qm' 같은 토큰을 탐지해서
-            self.SPECIAL_SOLVENTS에 매핑된 env_kind를 리턴.
-            """
-            candidates = []
-            if isinstance(solvent_name_l, str) and solvent_name_l:
-                candidates.append(solvent_name_l.strip().lower())
-            if isinstance(solvent_smile_raw, str) and solvent_smile_raw.strip():
-                candidates.append(solvent_smile_raw.strip().lower())
-
-            for raw, kind in self.SPECIAL_SOLVENTS.items():
-                raw_l = raw.strip().lower()
-                if any(c == raw_l for c in candidates):
-                    return kind
-            return None
-
         for i in tqdm(range(len(self.data)), desc="Building solute+solvent graphs"):
             try:
                 solute_text = self.data.loc[i, self.mol_col]
 
-                # --- Solvent 이름 (있으면) ---
-                solvent_name = (
-                    str(self.data.loc[i, "Solvent"])
-                    if "Solvent" in self.data.columns
-                    else ""
-                )
+                # ---- Solvent 이름 / SMILES
+                solvent_name = str(self.data.loc[i, "Solvent"]) if "Solvent" in self.data.columns else ""
                 solvent_name_l = solvent_name.lower().strip()
 
-                # --- solvent_smiles (SMILES 또는 'QM', 'gas', 'solid(neat)' 같은 토큰) ---
-                solvent_smile = (
-                    self.data.loc[i, self.solvent_mol_col]
-                    if self.solvent_mol_col in self.data.columns
-                    else None
-                )
+                solvent_smile = None
+                if self.solvent_mol_col in self.data.columns:
+                    solvent_smile = self.data.loc[i, self.solvent_mol_col]
 
                 # 1) solute graph
                 g_solute = smiles_or_inchi_to_graph(
@@ -268,26 +253,25 @@ class UnifiedSMILESDataset(Dataset):
                     BOND_FEATURES_VOCAB=BOND_FEATURES_VOCAB,
                 )
                 if g_solute is None:
-                    c_fail_solute_graph += 1
                     continue
 
-                # 2) solvent / env graph
-                env_kind = _detect_env_kind(solvent_name_l, solvent_smile)
+                # 2) solvent / 환경 graph
+                env_kind = None
+                for raw, kind in self.SPECIAL_SOLVENTS.items():
+                    if solvent_name_l == raw:
+                        env_kind = kind
+                        break
 
                 if env_kind is not None:
-                    # solid / gas / qm 등은 가상 환경 노드로 처리
                     g_solvent = self._make_virtual_env_graph(env_kind, ATOM_FEATURES_VOCAB)
-                    c_special_env += 1
                 else:
-                    # 진짜 solvent SMILES가 필요
                     if (
-                            solvent_smile is None
-                            or not isinstance(solvent_smile, str)
-                            or not solvent_smile.strip()
+                        solvent_smile is None
+                        or not isinstance(solvent_smile, str)
+                        or not solvent_smile.strip()
                     ):
-                        c_missing_solvent_smiles += 1
+                        # solvent SMILES 없으면 스킵(원하면 나중에 다른 처리)
                         continue
-
                     g_solvent = smiles_or_inchi_to_graph(
                         solvent_smile,
                         self.multi_hop_max_dist,
@@ -296,41 +280,22 @@ class UnifiedSMILESDataset(Dataset):
                         BOND_FEATURES_VOCAB=BOND_FEATURES_VOCAB,
                     )
                     if g_solvent is None:
-                        c_fail_solvent_graph += 1
                         continue
 
                 merged = self._merge_two_graphs_bipartite(g_solute, g_solvent)
                 if merged is None:
-                    c_fail_merge += 1
                     continue
 
                 self.raw_graphs.append(merged)
                 valid_indices.append(i)
                 expanded_targets.append(spectrum[i])
-                expanded_rows.append(self.data.iloc[i].to_dict())
-                c_ok += 1
+                expanded_rows.append(self.data.iloc[i].copy())
 
-            except Exception as e:
-                c_fail_merge += 1
-                # 디버그 원하면 주석 해제
-                # print(f"[row {i}] unexpected error: {e}")
+            except Exception:
+                # 에러 나면 해당 샘플은 스킵
                 continue
 
-        print("=== UnifiedSMILESDataset build summary ===")
-        print(f" total rows                 : {n_rows}")
-        print(f"  OK                        : {c_ok}")
-        print(f"  fail solute graph (RDKit) : {c_fail_solute_graph}")
-        print(f"  special env (solid/gas/qm): {c_special_env}")
-        print(f"  missing solvent_smiles    : {c_missing_solvent_smiles}")
-        print(f"  fail solvent graph        : {c_fail_solvent_graph}")
-        print(f"  fail merge/others         : {c_fail_merge}")
-
-        if len(expanded_targets) == 0:
-            raise RuntimeError(
-                "No valid solute+solvent graphs were built. "
-                "Solvent/solvent_smiles 컬럼 값과 SPECIAL_SOLVENTS 매핑 확인필요."
-            )
-
+        # 대상/데이터 재구성
         self.targets = (
             torch.as_tensor(np.stack(expanded_targets), dtype=torch.float32)
             if isinstance(spectrum, torch.Tensor)
@@ -339,10 +304,13 @@ class UnifiedSMILESDataset(Dataset):
 
         if mask_tensor is not None:
             self.masks = mask_tensor[valid_indices]
+
         self.data = pd.DataFrame(expanded_rows).reset_index(drop=True)
         self.graphs = self.raw_graphs
 
-        # ---------- x_cat 메타 (원자 feature 그룹만) ----------
+        # ------------------------------------------------------------
+        # x_cat 메타: 원자 feature 그룹만 (global node 없음)
+        # ------------------------------------------------------------
         atom_names = [k for k, v in ATOM_FEATURES_VOCAB.items() if isinstance(v, list)]
         atom_sizes = [len(ATOM_FEATURES_VOCAB[n]) for n in atom_names]
 
@@ -356,7 +324,7 @@ class UnifiedSMILESDataset(Dataset):
             "total_dim": int(sum(self.xcat_sizes)),
         }
 
-        # global single/multi 메타 (collate_fn에서 사용)
+        # ---- global single/multi 메타 (collate_fn에서 사용) ----
         self.global_single_cols = getattr(self, "_global_single_cols", [])
         self.global_single_sizes = [
             len(self.nominal_feature_vocab[c]) for c in self.global_single_cols
@@ -378,100 +346,15 @@ class UnifiedSMILESDataset(Dataset):
         if len(self.graphs) > 0:
             print("[DEBUG] example graph keys:", list(self.graphs[0].keys()))
 
-    # ---------- virtual env graph ----------
-
-    def _add_global_node(self, g):
-        """
-        기존 그래프 g 에 global node 1개를 추가한다.
-        - 새 노드는 index = old_N
-        - atom feature(x_cat, x_cont)는 전부 0 (dummy)
-        - 모든 노드와 fully-connected (adj / is_global 기준)
-        - 🔹 edge_index_bond 에는 global edge를 추가하지 않음
-        """
-        N = g["num_nodes"]
-        if N == 0:
-            return g  # 안전장치
-
-        # --- x_cat / x_cont ---
-        x_cat = g["x_cat"]
-        x_cont = g["x_cont"]
-
-        x_cat_global = np.zeros((1, x_cat.shape[1]), dtype=np.int64)
-        x_cont_global = np.zeros((1, x_cont.shape[1]), dtype=np.float32) \
-            if x_cont.shape[1] > 0 else np.zeros((1, 0), dtype=np.float32)
-
-        x_cat = np.concatenate([x_cat, x_cat_global], axis=0)
-        x_cont = np.concatenate([x_cont, x_cont_global], axis=0)
-
-        # --- adj ---
-        adj_old = g["adj"]
-        adj = np.zeros((N + 1, N + 1), dtype=np.int64)
-        adj[:N, :N] = adj_old
-        # global node <-> 모든 노드 연결 (virtual edge)
-        adj[N, :N] = 1
-        adj[:N, N] = 1
-        adj[N, N] = 0  # 자기자신 0
-
-        # --- spatial_pos ---
-        sp_old = g["spatial_pos"]
-        sp = np.full((N + 1, N + 1), 510.0, dtype=np.float32)
-        sp[:N, :N] = sp_old
-        np.fill_diagonal(sp, 0.0)
-        sp[N, :N] = 510.0
-        sp[:N, N] = 510.0
-
-        # --- attn_bias ---
-        attn_bias_old = g["attn_bias"]
-        attn_bias = np.zeros((N + 1, N + 1), dtype=np.float32)
-        attn_bias[:N, :N] = attn_bias_old
-
-        # --- attn_edge_type ---
-        attn_edge_type_old = g["attn_edge_type"]
-        attn_edge_type = {}
-        for key, t in attn_edge_type_old.items():
-            D = t.shape[-1]
-            new_t = np.zeros((N + 1, N + 1, D), dtype=np.int64)
-            new_t[:N, :N, :] = t
-
-            if key == "is_global":
-                # 기존 solute<->solvent 1 유지 + global<->모든노드 1 추가
-                new_t[N, :N, 0] = 1  # global -> others
-                new_t[:N, N, 0] = 1  # others -> global
-
-            attn_edge_type[key] = new_t
-
-        # --- edge_input (multi-hop) ---
-        edge_input_old = g["edge_input"]
-        edge_input = {}
-        for key, t in edge_input_old.items():
-            max_dist, D = t.shape[2], t.shape[-1]
-            new_t = np.zeros((N + 1, N + 1, max_dist, D), dtype=np.int64)
-            new_t[:N, :N, :, :] = t
-            # global 관련 edge는 전부 0 (virtual)
-            edge_input[key] = new_t
-
-        # --- bond edge index (degree용) ---
-        edge_index_bond_old = g.get("edge_index_bond", None)
-        if edge_index_bond_old is not None:
-            edge_index_bond = edge_index_bond_old.copy()
-        else:
-            edge_index_bond = None
-
-        return {
-            "num_nodes": N + 1,
-            "x_cat": x_cat,
-            "x_cont": x_cont,
-            "edge_index": None,  # full edge는 필요 시 adj에서 재계산
-            "edge_index_bond": edge_index_bond,  # 🔹 bond edge는 그대로
-            "adj": adj,
-            "attn_edge_type": attn_edge_type,
-            "spatial_pos": sp,
-            "attn_bias": attn_bias,
-            "edge_input": edge_input,
-        }
+    # ============================================================
+    #  Virtual env graph (solid / gas / qm)
+    # ============================================================
 
     def _make_virtual_env_graph(self, env_kind, ATOM_FEATURES_VOCAB):
-        """solid / gas / qm 전용 1-node 환경 그래프"""
+        """
+        env_kind: "solid" / "gas" / "qm"
+        1개의 dummy node 를 가지는 '환경 그래프' 생성
+        """
         num_nodes = 1
 
         atom_names = [k for k, v in ATOM_FEATURES_VOCAB.items() if isinstance(v, list)]
@@ -484,10 +367,8 @@ class UnifiedSMILESDataset(Dataset):
             "qm": "ENV_QM",
         }
         token = env_token_map[env_kind]
-
         atom_vocab = ATOM_FEATURES_VOCAB["atomic_num"]
         if token not in atom_vocab:
-            #print("not in",token)
             atom_vocab.append(token)
         env_idx = atom_vocab.index(token)
 
@@ -498,8 +379,11 @@ class UnifiedSMILESDataset(Dataset):
 
         edge_index = np.zeros((2, 0), dtype=np.int64)
         adj = np.zeros((num_nodes, num_nodes), dtype=np.int64)
+
         spatial_pos = np.zeros((num_nodes, num_nodes), dtype=np.float32)
 
+        # 가상 그래프에는 attn_edge_type / edge_input 을 비워둔다.
+        # merge 시에 전체 zero tensor에서 일부를 채워 넣기 때문에 없어도 됨.
         attn_edge_type = {}
         edge_input = {}
 
@@ -515,11 +399,18 @@ class UnifiedSMILESDataset(Dataset):
             "edge_input": edge_input,
         }
 
-    # ---------- solute + solvent 병합 ----------
+    # ============================================================
+    #  Solute + Solvent 그래프 병합
+    # ============================================================
 
     def _merge_two_graphs_bipartite(self, g1, g2):
-        """solute 그래프와 solvent(or env) 그래프를 하나로 합치고,
-        두 파트 사이를 fully-connected bipartite edge + is_global=1 로 연결."""
+        """
+        g1: solute_graph
+        g2: solvent_graph or virtual env graph
+
+        두 그래프를 하나로 합치고,
+        solute 모든 노드와 solvent 모든 노드 사이에 'is_global=1' edge 를 추가.
+        """
         if g1 is None or g2 is None:
             return None
 
@@ -527,6 +418,7 @@ class UnifiedSMILESDataset(Dataset):
         n2 = g2["num_nodes"]
         N = n1 + n2
 
+        # ---- 노드 피처
         x_cat = np.concatenate([g1["x_cat"], g2["x_cat"]], axis=0)
         x_cont = np.concatenate(
             [
@@ -536,40 +428,37 @@ class UnifiedSMILESDataset(Dataset):
             axis=0,
         )
 
-        # ---------- (1) bond edge 전용 index ----------
-        e1 = g1["edge_index"]  # solute 내부 bond
-        e2 = g2["edge_index"].copy()  # solvent(or env) 내부 bond
+        # ---- edge_index / adj
+        e1 = g1["edge_index"]
+        e2 = g2["edge_index"].copy()
         if e2.size > 0:
-            e2 = e2 + n1  # 노드 인덱스 shift
-            edge_index_bond = np.concatenate([e1, e2], axis=1)
+            e2 = e2 + n1
+            edge_index = np.concatenate([e1, e2], axis=1)
         else:
-            edge_index_bond = e1.copy()  # solvent가 1-node env면 그대로
-
-        # ---------- (2) full edge (bond + solute–solvent virtual) ----------
-        edge_index_full = edge_index_bond.copy()
+            edge_index = e1.copy()
 
         adj = np.zeros((N, N), dtype=np.int64)
         adj[:n1, :n1] = g1["adj"]
         adj[n1:, n1:] = g2["adj"]
 
-        # solute–solvent fully-connected virtual edge
+        # solute ↔ solvent fully connected (양방향)
         for i in range(n1):
             for j in range(n1, N):
                 adj[i, j] = 1
                 adj[j, i] = 1
-                edge_index_full = np.concatenate(
-                    [edge_index_full, np.array([[i, j], [j, i]], dtype=np.int64)],
-                    axis=1,
+                edge_index = np.concatenate(
+                    [edge_index, np.array([[i, j], [j, i]], dtype=np.int64)], axis=1
                 )
 
-        # ---------- (3) spatial_pos / attn_edge_type / edge_input ----------
+        # ---- spatial_pos: 기존 값 유지, cross 는 1, diag 0
         sp = np.full((N, N), 510.0, dtype=np.float32)
         sp[:n1, :n1] = g1["spatial_pos"]
         sp[n1:, n1:] = g2["spatial_pos"]
         np.fill_diagonal(sp, 0.0)
-        sp[:n1, n1:] = 510
-        sp[n1:, :n1] = 510
+        sp[:n1, n1:] = 1.0
+        sp[n1:, :n1] = 1.0
 
+        # ---- attn_edge_type 병합
         attn_edge_type = {}
         keys = set(g1.get("attn_edge_type", {}).keys()) | set(
             g2.get("attn_edge_type", {}).keys()
@@ -591,13 +480,14 @@ class UnifiedSMILESDataset(Dataset):
             if t2 is not None:
                 t[n1:, n1:, :] = t2
 
+            # solute–solvent cross edge: is_global 채널 1로
             if key == "is_global":
-                # solute–solvent 사이 virtual edge에 is_global=1
                 t[:n1, n1:, 0] = 1
                 t[n1:, :n1, 0] = 1
 
             attn_edge_type[key] = t
 
+        # ---- edge_input 병합 (multi-hop)
         edge_input = {}
         keys = set(g1.get("edge_input", {}).keys()) | set(
             g2.get("edge_input", {}).keys()
@@ -618,24 +508,24 @@ class UnifiedSMILESDataset(Dataset):
                 t[:n1, :n1, :, :] = t1
             if t2 is not None:
                 t[n1:, n1:, :, :] = t2
+            # solute–solvent cross 부분은 0 그대로
             edge_input[key] = t
 
-        merged = {
+        return {
             "num_nodes": N,
             "x_cat": x_cat,
             "x_cont": x_cont,
-            "edge_index": edge_index_full,  # full edge (attention/adj용)
-            "edge_index_bond": edge_index_bond,  # 🔹 degree용 bond edge
+            "edge_index": edge_index,
             "adj": adj,
             "attn_edge_type": attn_edge_type,
             "spatial_pos": sp,
             "attn_bias": np.zeros((N, N), dtype=np.float32),
             "edge_input": edge_input,
         }
-        merged_with_global = self._add_global_node(merged)
-        return merged_with_global
 
-    # ---------- nominal/global helpers ----------
+    # ============================================================
+    #   표준 함수들 (target, preprocess, global feature 등)
+    # ============================================================
 
     def _build_nominal_feature_info(self):
         return {
@@ -647,21 +537,26 @@ class UnifiedSMILESDataset(Dataset):
         }
 
     def _get_all_cols_to_load(self):
-        if self.target_type == "exp_spectrum":
+        # target 컬럼
+        if self.target_type in ["ex_prob", "nm_distribution"]:
+            target_cols = [f"ex{i}" for i in range(1, 51)] + [
+                f"prob{i}" for i in range(1, 51)
+            ]
+        elif self.target_type == "exp_spectrum":
             nm_min, nm_max = self.intensity_range
             target_cols = [str(i) for i in range(nm_min, nm_max + 1)]
         else:
             target_cols = []
 
         required_cols = [self.mol_col] + target_cols
+
         extra_cols = []
 
-        if "Solvent" in self.data.columns:
+        # Solvent, solvent_smiles, Solvent_primary_token
+        if "Solvent" not in self.nominal_feature_vocab and "Solvent" in self.data.columns:
             extra_cols.append("Solvent")
         if "Solvent_primary_token" in self.data.columns:
             extra_cols.append("Solvent_primary_token")
-        if "pH" in self.data.columns:
-            extra_cols.append("pH")
         if self.solvent_mol_col in self.data.columns:
             extra_cols.append(self.solvent_mol_col)
 
@@ -677,20 +572,116 @@ class UnifiedSMILESDataset(Dataset):
             if col not in self.data.columns:
                 raise ValueError(f"Missing required column '{col}' in {csv_file}")
 
-    # ---------- target 처리 ----------
+    # --------------------- target 처리 --------------------------
 
     def process_targets(self, n_pairs=None):
-        if self.target_type == "exp_spectrum":
+        if self.target_type == "default":
+            arr = self.data.iloc[:, 1:101].values
+            return torch.tensor(arr, dtype=torch.float32)
+
+        elif self.target_type == "ex_prob":
+            arr = self.data.iloc[:, 1:101].values
+            max_pairs = arr.shape[1] // 2
+            if n_pairs is None or n_pairs > max_pairs:
+                n_pairs = max_pairs
+            ex = arr[:, :max_pairs]
+            prob = arr[:, max_pairs:]
+
+            # intensity 기준 정렬
+            sorted_idx = np.argsort(-prob, axis=1)
+            top_idx = sorted_idx[:, :n_pairs]
+            ex_top = np.take_along_axis(ex, top_idx, axis=1)
+            prob_top = np.take_along_axis(prob, top_idx, axis=1)
+
+            # eV 기준 정렬
+            asc_idx = np.argsort(ex_top, axis=1)
+            ex_top = np.take_along_axis(ex_top, asc_idx, axis=1)
+            prob_top = np.take_along_axis(prob_top, asc_idx, axis=1)
+
+            # ex 정규화
+            if self.ex_normalize == "ex_min_max":
+                ex_top = (ex_top - self.global_ex_min) / (
+                    self.global_ex_max - self.global_ex_min + 1e-8
+                )
+            elif self.ex_normalize == "ex_std":
+                ex_top = (ex_top - self.global_ex_mean) / (
+                    self.global_ex_std + 1e-8
+                )
+            elif self.ex_normalize in ["none", None]:
+                pass
+            else:
+                raise ValueError(f"Unknown ex_normalize: {self.ex_normalize}")
+
+            # prob 정규화
+            if self.prob_normalize == "prob_min_max":
+                prob_top = (prob_top - self.global_prob_min) / (
+                    self.global_prob_max - self.global_prob_min + 1e-8
+                )
+            elif self.prob_normalize == "prob_std":
+                prob_top = (prob_top - self.global_prob_mean) / (
+                    self.global_prob_std + 1e-8
+                )
+            elif self.prob_normalize in ["none", None]:
+                pass
+            else:
+                raise ValueError(f"Unknown prob_normalize: {self.prob_normalize}")
+
+            stacked = np.stack((ex_top, prob_top), axis=-1)
+            return torch.tensor(stacked, dtype=torch.float32)
+
+        elif self.target_type == "nm_distribution":
+            ex = self.data[[f"ex{i}" for i in range(1, 51)]].values
+            prob = self.data[[f"prob{i}" for i in range(1, 51)]].values
+            nm = (1239.841984 / ex).round().astype(int)
+
+            if self.intensity_normalize == "min_max":
+                prob = (prob - self.global_prob_min) / (
+                    self.global_prob_max - self.global_prob_min + 1e-8
+                )
+
+            nm_min, nm_max = self.intensity_range
+            nm = np.clip(nm, nm_min, nm_max)
+            spec_len = nm_max - nm_min + 1
+            out = np.zeros((len(self.data), spec_len), dtype=np.float32)
+
+            if self.nm_dist_mode == "hist":
+                for i, (row_nm, row_p) in enumerate(zip(nm, prob)):
+                    for lam, p in zip(row_nm, row_p):
+                        if nm_min <= lam <= nm_max:
+                            out[i, lam - nm_min] += p
+
+            elif self.nm_dist_mode == "gauss":
+                bins = np.arange(nm_min, nm_max + 1)
+                sigma = self.nm_gauss_sigma
+                for i, (row_nm, row_p) in enumerate(zip(nm, prob)):
+                    spec = np.zeros_like(bins, dtype=np.float32)
+                    for lam, p in zip(row_nm, row_p):
+                        if nm_min <= lam <= nm_max and p > 0:
+                            kernel = np.exp(-0.5 * ((bins - lam) / sigma) ** 2)
+                            kernel /= kernel.sum() + 1e-8
+                            spec += p * kernel
+                    out[i] = spec
+            else:
+                raise ValueError(f"Unknown nm_dist_mode: {self.nm_dist_mode}")
+
+            return torch.tensor(out, dtype=torch.float32)
+
+        elif self.target_type == "exp_spectrum":
             nm_min, nm_max = self.intensity_range
             target_cols = [str(i) for i in range(nm_min, nm_max + 1)]
-            existing_cols = [c for c in target_cols if c in self.data.columns]
+            existing_cols = [col for col in target_cols if col in self.data.columns]
             missing_cols = set(target_cols) - set(existing_cols)
-            for c in missing_cols:
-                self.data[c] = 0.0
+            if missing_cols:
+                print(
+                    f"[Warning] {len(missing_cols)} missing columns will be filled with zeros"
+                )
+            for col in missing_cols:
+                self.data[col] = 0.0
 
             spectrum = self.data[target_cols].fillna(0.0).values
 
-            normed, masks = [], []
+            normed = []
+            masks = []
             for row in spectrum:
                 mask = row != 0
                 if np.sum(mask) == 0:
@@ -712,7 +703,7 @@ class UnifiedSMILESDataset(Dataset):
         else:
             raise ValueError(f"Unknown target_type: {self.target_type}")
 
-    # ---------- graph → tensor ----------
+    # --------------------- 그래프 전처리 --------------------------
 
     def preprocess_graph(self, graph):
         num_nodes = graph["num_nodes"]
@@ -720,26 +711,9 @@ class UnifiedSMILESDataset(Dataset):
         x_cat = torch.from_numpy(graph["x_cat"]).long()
         x_cont = torch.from_numpy(graph["x_cont"]).float()
 
-        # --- full edge (필요할 때만 사용, degree에는 안 씀) ---
-        edge_index_full_np = graph.get("edge_index", None)
-        if edge_index_full_np is None:
-            adj_np = graph["adj"]  # (N, N)
-            src, dst = np.where(adj_np > 0)
-            edge_index_full_np = np.stack([src, dst], axis=0)  # (2, E)
-
-        # --- degree 계산용: bond edge만 사용 ---
-        bond_edge_index_np = graph.get("edge_index_bond", None)
-        if bond_edge_index_np is None:
-            # 혹시 없는 경우에는 full edge로 fallback
-            bond_edge_index_np = edge_index_full_np
-
-        deg_edge_index = torch.from_numpy(bond_edge_index_np).long()
-        in_deg = torch.bincount(deg_edge_index[1], minlength=num_nodes).long()
-        out_deg = torch.bincount(deg_edge_index[0], minlength=num_nodes).long()
-
-        # 🔹 여기서 global node는 bond_edge_index에 등장하지 않으므로
-        #     in_deg[global_idx] == out_deg[global_idx] == 0 이 됨
-        #    (qm/gas/solid 가상 env node도 마찬가지)
+        edge_index = torch.tensor(graph["edge_index"], dtype=torch.long)
+        in_deg = torch.bincount(edge_index[1], minlength=num_nodes).long()
+        out_deg = torch.bincount(edge_index[0], minlength=num_nodes).long()
 
         adj = torch.from_numpy(graph["adj"])
         spatial_pos = torch.from_numpy(graph["spatial_pos"]).float()
@@ -765,7 +739,8 @@ class UnifiedSMILESDataset(Dataset):
             "num_nodes": num_nodes,
         }
 
-        if self.x_cat_mode == "onehot":
+        # ---- x_cat → onehot (원자 feature 그룹만) ----
+        if getattr(self, "x_cat_mode", "index") == "onehot":
             X_idx = g["x_cat"]
             sizes = self.xcat_sizes
             pieces = []
@@ -782,11 +757,13 @@ class UnifiedSMILESDataset(Dataset):
                 "offsets": torch.tensor(self.xcat_meta["offsets"], dtype=torch.long),
                 "total_dim": self.xcat_meta["total_dim"],
             }
+
         return g
 
-    # ---------- global feature -> tensor ----------
+    # --------------------- global feature tensor -------------------
 
     def _get_global_feature_cat_tensor(self, idx):
+        """싱글 전역 카테고리만 인덱스 반환"""
         indices = []
         for name in self._global_single_cols:
             val = self.data.loc[idx, name]
@@ -804,7 +781,9 @@ class UnifiedSMILESDataset(Dataset):
             vals.append(float(v) if pd.notna(v) else 0.0)
         return torch.tensor(vals, dtype=torch.float32)
 
-    # ---------- Dataset API ----------
+    # ============================================================
+    #  Dataset API
+    # ============================================================
 
     def __getitem__(self, idx):
         tgt = self.targets[idx]
@@ -853,6 +832,14 @@ class UnifiedSMILESDataset(Dataset):
                 g_processed["global_features_cont"] = global_cont
             return g_processed, tgt, idx
 
+        elif self.mode == "cls_global_model":
+            extras = {}
+            if global_cat.numel() > 0:
+                extras["global_features_cat"] = global_cat
+            if global_cont.numel() > 0:
+                extras["global_features_cont"] = global_cont
+            return g_processed, tgt, idx, extras
+
         # cls only
         return g_processed, tgt, idx
 
@@ -860,11 +847,12 @@ class UnifiedSMILESDataset(Dataset):
         return len(self.graphs)
 
 
-# =========================================
+# ============================================================
 #  collate_fn
-# =========================================
+# ============================================================
 
 def collate_fn(batch, ds: UnifiedSMILESDataset):
+    # 유효 샘플만
     batch = [b for b in batch if b is not None and b[0] is not None]
     if not batch:
         return None
@@ -890,6 +878,7 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
             )
         return torch.stack(list_of_tensors)
 
+    # ---- node features
     collated_x_cat = (
         _stack_opt([_pad2d(g["x_cat"], max_nodes, 0) for g in graphs])
         if "x_cat" in graphs[0]
@@ -901,6 +890,7 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
         else None
     )
 
+    # already computed onehot
     if "x_cat_onehot" in graphs[0]:
         x_cat_oh_batch = []
         for g in graphs:
@@ -911,6 +901,7 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
     else:
         collated_x_cat_onehot, x_cat_onehot_meta = None, None
 
+    # ---- graph tensors
     adj_list, spatial_pos_list, attn_bias_list = [], [], []
     in_degree_list, out_degree_list = [], []
     deg_max = getattr(ds, "deg_clip_max", 5)
@@ -959,8 +950,17 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
         [torch.stack(coll_edge_input[k]) for k in coll_edge_input], dim=-1
     )
 
-    # ---- global features ----
-    if ds.mode == "cls_global_data":
+    # ---- global features (sing글 index + multi onehot) ----
+    if ds.mode == "cls_global_model":
+        cat_list = [
+            b[3].get("global_features_cat", torch.empty(0, dtype=torch.float32))
+            for b in batch
+        ]
+        cont_list = [
+            b[3].get("global_features_cont", torch.empty(0, dtype=torch.float32))
+            for b in batch
+        ]
+    elif ds.mode == "cls_global_data":
         cat_list = [
             g.get("global_features_cat", torch.empty(0, dtype=torch.float32))
             for g in graphs
@@ -975,6 +975,7 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
     collated_global_cat = _stack_opt(cat_list)
     collated_global_cont = _stack_opt(cont_list)
 
+    # multi-hot (예: Solvent)
     def _split_tokens(cell: str):
         if not isinstance(cell, str) or not cell.strip():
             return []
@@ -1019,6 +1020,7 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
     concat_vocabs = {n: list(ds.nominal_feature_vocab[n]) for n in concat_names}
     concat_types = (["single"] * len(single_names)) + (["multi"] * len(multi_names))
 
+    # ---- 결과 패킹 ----
     res = {
         "adj": torch.stack(adj_list),
         "spatial_pos": torch.stack(spatial_pos_list),
@@ -1039,7 +1041,7 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
         if x_cat_onehot_meta is not None:
             res["x_cat_onehot_meta"] = x_cat_onehot_meta
 
-    if ds.mode == "cls_global_data":
+    if ds.mode in ["cls_global_data", "cls_global_model"]:
         res["global_features_cat"] = global_cat_all
         res["global_features_cat_meta"] = {
             "names": concat_names,
@@ -1056,6 +1058,7 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
         mask_batch = torch.as_tensor(ds.masks[tgt_idx], dtype=torch.bool).unsqueeze(-1)
         res["masks"] = mask_batch
 
+    # edge feature 메타
     edge_groups = [
         ("bond_type", 4),
         ("stereo", 6),
@@ -1074,144 +1077,4 @@ def collate_fn(batch, ds: UnifiedSMILESDataset):
     }
 
     return res
-
-
-# =========================================
-#  main: CSV 불러서 한번 돌려보기
-# =========================================
-
-# =========================================
-#  main: Pre_Defined_Vocab_Generator 사용해서 테스트
-# =========================================
-if __name__ == "__main__":
-    from Pre_Defined_Vocab_Generator import generate_graphormer_config
-
-    # 1) CSV 경로 지정 (train/test 둘 다 넣어서 vocab을 통합으로 만들기 추천)
-    train_csv = r"C:\Users\kogun\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\EM_with_solvent_smiles_train.csv"
-    test_csv  = r"C:\Users\kogun\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\EM_with_solvent_smiles_test.csv"
-
-    dataset_path_list = [train_csv, test_csv]  # 필요하면 하나만 넣어도 됨
-
-    # 2) config + vocab 자동 생성
-    #   - target_type="exp_spectrum" : 지금 UnifiedSMILESDataset이 지원하는 모드
-    #   - mol_col="smiles" : 네 CSV 기준
-    # 1) config 생성 (리턴값 1개)
-    config = generate_graphormer_config(
-        dataset_path_list=dataset_path_list,
-        mode="cls_global_data",  # global feature 사용
-        mol_col="smiles",
-        target_type="exp_spectrum",
-        intensity_range=(200, 800),
-        global_feature_order=["pH_label"],  # ✅ pH_label만 사용
-        global_multihot_cols={},  # ✅ Solvent multihot 안 씀
-        continuous_feature_names=[],  # 그대로 사용
-    )
-    print("config", config)
-
-
-    # 2) config 안에서 필요한 vocab / 설정 꺼내기
-    ATOM_FEATURES_VOCAB = config["ATOM_FEATURES_VOCAB"]
-    BOND_FEATURES_VOCAB = config["BOND_FEATURES_VOCAB"]
-    GLOBAL_FEATURE_VOCABS_dict = config["GLOBAL_FEATURE_VOCABS_dict"]
-
-    nominal_feature_vocab = config["nominal_feature_vocab"]
-    continuous_feature_names = config["continuous_feature_names"]
-    float_feature_keys = config["ATOM_FLOAT_FEATURE_KEYS"]
-
-    global_cat_dim = config["global_cat_dim"]
-    global_cont_dim = config["global_cont_dim"]
-    multi_hop_max_dist = config["multi_hop_max_dist"]
-    intensity_range = config["intensity_range"]
-
-    print("nominal_feature_vocab keys :", nominal_feature_vocab.keys())
-    print("continuous_feature_names   :", continuous_feature_names)
-    print("global_single_cols 후보     :", [k for k in nominal_feature_vocab.keys()])
-
-    # 3) Dataset 생성
-    ds = UnifiedSMILESDataset(
-        csv_file=train_csv,
-        nominal_feature_vocab=nominal_feature_vocab,
-        continuous_feature_names=continuous_feature_names,
-        global_cat_dim=global_cat_dim,
-        global_cont_dim=global_cont_dim,
-        ATOM_FEATURES_VOCAB=ATOM_FEATURES_VOCAB,
-        float_feature_keys=float_feature_keys,
-        BOND_FEATURES_VOCAB=BOND_FEATURES_VOCAB,
-        GLOBAL_FEATURE_VOCABS_dict=GLOBAL_FEATURE_VOCABS_dict,
-        x_cat_mode="index",  # 필요하면 "onehot"
-        global_cat_mode="onehot",  # pH_label, type, Solvent 등을 one-hot global로 사용
-        mol_col="smiles",
-        solvent_mol_col="solvent_smiles",
-        mode="cls_global_data",  # global_features_cat/cont 사용
-        max_nodes=128,
-        multi_hop_max_dist=multi_hop_max_dist,
-        target_type="exp_spectrum",
-        intensity_range=intensity_range,
-    )
-
-    loader = DataLoader(
-        ds,
-        batch_size=4,
-        shuffle=False,
-        collate_fn=lambda b: collate_fn(b, ds),
-    )
-
-    batch = next(iter(loader))
-    print("Batch keys:", batch.keys())
-    print("adj shape:", batch["adj"].shape)
-    print("targets shape:", batch["targets"].shape)
-    if "x_cat" in batch:
-        print("x_cat shape:", batch["x_cat"].shape)
-    if "x_cat_onehot" in batch:
-        print("x_cat_onehot shape:", batch["x_cat_onehot"].shape)
-    if "global_features_cat" in batch:
-        print("global_features_cat shape:", batch["global_features_cat"].shape)
-        print("global_features_cat_meta.names:", batch["global_features_cat_meta"]["names"])
-    if "global_features_cont" in batch:
-        print("global_features_cont shape:", batch["global_features_cont"].shape)
-
-    # ================================
-    # 1) batch 전체 내용을 한 번에 출력
-    # ================================
-    print("\n=== Batch overview ===")
-    for key, val in batch.items():
-        if isinstance(val, torch.Tensor):
-            info = f"{key}: shape={tuple(val.shape)}, dtype={val.dtype}"
-            # 숫자 텐서면 min/max도 출력
-            try:
-                if val.numel() > 0 and val.dtype != torch.bool:
-                    vmin = val.min().item()
-                    vmax = val.max().item()
-                    info += f", min={vmin}, max={vmax}"
-            except Exception:
-                pass
-            print(info)
-        else:
-            # 텐서가 아닌 경우 (meta dict 등)
-            print(f"{key}: type={type(val)}")
-
-    # ================================
-    # 2) in_degree / out_degree 최소·최대 출력
-    # ================================
-    in_deg_batch = batch["in_degree"]  # (B, max_nodes)
-    out_deg_batch = batch["out_degree"]  # (B, max_nodes)
-
-    # 전체 배치 기준
-    print("\n=== Degree stats (whole batch) ===")
-    print(f"in_degree  : min={in_deg_batch.min().item()}, max={in_deg_batch.max().item()}")
-    print(f"out_degree : min={out_deg_batch.min().item()}, max={out_deg_batch.max().item()}")
-
-    # 각 그래프별로도 확인 (예: 앞 4개만)
-    print("\n=== Degree stats per graph (first few in batch) ===")
-    B = in_deg_batch.size(0)
-    for b in range(B):
-        in_b = in_deg_batch[b]
-        out_b = out_deg_batch[b]
-
-        # 패딩 노드(완전 0)까지 포함한 min/max
-        print(f"[graph {b}] in_degree(min,max)  = ({in_b.min().item()}, {in_b.max().item()})")
-        print(f"[graph {b}] out_degree(min,max) = ({out_b.min().item()}, {out_b.max().item()})")
-
-        # 마지막 노드(global node) in/out degree 확인
-        print(f"   last node (global) in_degree={in_b[-1].item()}, out_degree={out_b[-1].item()}")
 
