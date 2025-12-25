@@ -297,7 +297,7 @@ class GraphAttnBias(nn.Module):
         spatial_pos_processed[torch.isinf(spatial_pos_processed)] = 0
         spatial_pos_bias = self.spatial_pos_encoder(spatial_pos_processed.unsqueeze(-1)).permute(0, 3, 1, 2).contiguous()
         pad_mask = (spatial_pos >= self.spatial_pos_pad_val).unsqueeze(1)
-        spatial_pos_bias = spatial_pos_bias.masked_fill(pad_mask, -1e9)
+        spatial_pos_bias = spatial_pos_bias.masked_fill(pad_mask, float("-inf")) #  AMP16 문제로 인해 1e-9 -> -inf
 
         graph_attn_bias = graph_attn_bias + spatial_pos_bias
 

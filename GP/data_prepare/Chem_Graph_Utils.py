@@ -329,6 +329,8 @@ def mol_to_graph_customized(
         k: np.zeros((num_nodes, num_nodes, len(vocab)), dtype=np.int64)
         for k, vocab in BOND_FEATURES_VOCAB.items()
     }
+    attn_edge_type["is_global"] = np.zeros((num_nodes, num_nodes, 1), dtype=np.int64)
+
     edge_indices: List[List[int]] = []
 
     for bond in mol.GetBonds():
@@ -358,6 +360,7 @@ def mol_to_graph_customized(
         key: np.zeros((num_nodes, num_nodes, multi_hop_max_dist, len(vocab)), dtype=np.int64)
         for key, vocab in BOND_FEATURES_VOCAB.items()
     }
+    edge_input["is_global"] = np.zeros((num_nodes, num_nodes, multi_hop_max_dist, 1), dtype=np.int64)
 
     # BFS 기반 경로 복원으로 hop별 edge 타입 채우기
     for i in range(num_nodes):
