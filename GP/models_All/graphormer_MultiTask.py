@@ -113,8 +113,7 @@ class GraphormerMultiBranchModel(nn.Module):
       shared_layers (n)
         ├─ spectrum branch: spec_layers (k_spec) + spec_mlp (-> spectrum_dim)
         └─ point branch: point_trunk_layers (k_point)
-              ├─ abs_lambda : prop_layers[j] + head
-              ├─ em_lambda  : prop_layers[j] + head
+              ├─ max_nm : prop_layers[j] + head
               ├─ lifetime   : prop_layers[j] + head
               └─ qy         : prop_layers[j] + head
     """
@@ -136,11 +135,10 @@ class GraphormerMultiBranchModel(nn.Module):
         self.point_trunk_layers = int(config.get("point_trunk_layers", 2))
 
         # property별 tail layer 수 (j)
-        # 예: {"abs_lambda": 1, "em_lambda": 1, "lifetime": 1, "qy": 1}
         self.prop_layers: Dict[str, int] = dict(config.get("prop_layers", {}))
         if not self.prop_layers:
-            # 기본값
-            self.prop_layers = {"abs_lambda": 1, "em_lambda": 1, "lifetime": 1, "qy": 1}
+            # 기본값: ABS/EM 분리 제거 -> max_nm 하나로
+            self.prop_layers = {"max_nm": 1, "life": 1, "qy": 1}
 
         # ------------- output dims -------------
         self.spectrum_dim = int(config.get("spectrum_output_size", config.get("output_size", 601)))
@@ -236,6 +234,74 @@ class GraphormerMultiBranchModel(nn.Module):
         # ------------- freeze config -------------
         self._spec_frozen = False
 
+        self._print_init_summary(config)
+
+    def _print_init_summary(self, config: Dict[str, Any]):
+        def _g(k, default=None):
+            return config.get(k, default)
+
+        print("\n" + "="*60)
+        print("[GraphormerMultiBranchModel] Init Summary")
+        print("-"*60)
+
+        # Core encoder
+        print(f"mode                : {self.mode}")
+        print(f"embedding_dim (H)    : {self.embedding_dim}")
+        print(f"num_attention_heads  : {_g('num_attention_heads')}")
+        print(f"ffn_embedding_dim    : {_g('ffn_embedding_dim')}")
+        print(f"dropout              : {_g('dropout')}")
+        print(f"attn_dropout         : {_g('attention_dropout')}")
+        print(f"act_dropout          : {_g('activation_dropout')}")
+        print(f"activation_fn        : {_g('activation_fn')}")
+        print(f"pre_layernorm        : {_g('pre_layernorm', False)}")
+        print(f"q_noise / qn_block   : {_g('q_noise', 0.0)} / {_g('qn_block_size', 8)}")
+
+        # Graph vocab / edge settings
+        print("-"*60)
+        print(f"num_atoms            : {_g('num_atoms')}")
+        print(f"num_edges            : {_g('num_edges')}")
+        print(f"edge_type            : {_g('edge_type')}")
+        print(f"multi_hop_max_dist   : {_g('multi_hop_max_dist')}")
+        print(f"num_spatial          : {_g('num_spatial')}")
+        print(f"num_edge_dis         : {_g('num_edge_dis')}")
+
+        # Global features
+        print("-"*60)
+        print(f"global_cat_dim       : {_g('global_cat_dim', 0)}")
+        print(f"global_cont_dim      : {_g('global_cont_dim', 0)}")
+        print(f"num_categorical_feats: {_g('num_categorical_features')}")
+        print(f"num_continuous_feats : {_g('num_continuous_features')}")
+
+        # Branch split
+        print("-"*60)
+        print(f"shared_layers        : {self.shared_layers}")
+        print(f"spec_layers          : {self.spec_layers}")
+        print(f"point_trunk_layers   : {self.point_trunk_layers}")
+        print(f"prop_layers          : {self.prop_layers}")
+        print(f"prop_output_dims     : {self.prop_output_dims}")
+
+        # Heads
+        print("-"*60)
+        print(f"spectrum_dim         : {self.spectrum_dim}")
+        print(f"spec_head            : {self.spec_head.__class__.__name__}")
+        print("prop heads:")
+        for k in self.prop_layers.keys():
+            head = self.prop_heads[k] if hasattr(self, "prop_heads") and k in self.prop_heads else None
+            head_name = head.__class__.__name__ if head is not None else "N/A"
+            print(f"  - {k:10s} -> out_dim={self.prop_output_dims.get(k, 1)} | tail_layers={len(self.prop_tails[k])} | head={head_name}")
+
+        # 실제 모듈 길이 확인
+        print("-"*60)
+        print(f"encoder.num_layers    : {getattr(self.encoder, 'num_layers', 'N/A')}")
+        print(f"len(encoder.layers)   : {len(getattr(self.encoder, 'layers', []))}")
+        print(f"len(spec_branch)      : {len(self.spec_branch_layers)}")
+        print(f"len(point_trunk)      : {len(self.point_trunk)}")
+        for k in self.prop_tails.keys():
+            print(f"len(prop_tails[{k}])  : {len(self.prop_tails[k])}")
+
+        print("="*60 + "\n")
+
+
     # -------------------------
     # hook: capture per-forward signature/tensors : encoder.layers[0]가 호출되기 직전에, 그 레이어에 들어갈 입력 인자(args/kwargs) 를 그대로 저장
     # -------------------------
@@ -298,13 +364,12 @@ class GraphormerMultiBranchModel(nn.Module):
     def forward(self, batched_data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         return:
-          {
-            "spectrum": [B, spectrum_dim],
-            "abs_lambda": [B, d],
-            "em_lambda":  [B, d],
-            "lifetime":   [B, d],
-            "qy":         [B, d],
-          }
+        {
+          "spectrum": [B, spectrum_dim],
+          "max_nm":   [B, 1],
+          "life":     [B, 1],
+          "qy":       [B, 1],
+        }
         """
 
         # hook에서 이 배치의 호출 args/kwargs 확보
@@ -321,8 +386,11 @@ class GraphormerMultiBranchModel(nn.Module):
         args = self._last_layer_args
         kwargs = self._last_layer_kwargs
 
-        #print("[DEBUG] x_shared:", tuple(x_shared.shape))  # (T,B,H)에서 T가 1이면 아직 문제
-        #print("[DEBUG] attn_bias:", tuple(kwargs["attn_bias"].shape) if "attn_bias" in kwargs else None)
+        #print("[DEBUG] self_attn_bias:",
+        #      tuple(kwargs["self_attn_bias"].shape) if "self_attn_bias" in kwargs else None)
+        #print("[DEBUG] self_attn_padding_mask:",
+        #      tuple(kwargs["self_attn_padding_mask"].shape) if "self_attn_padding_mask" in kwargs else None)
+        #print(kwargs.keys())
 
         # 2) spectrum branch
         x_spec = x_shared

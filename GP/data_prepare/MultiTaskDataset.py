@@ -75,15 +75,56 @@ class MultiTaskSMILESDataset(UnifiedSMILESDataset):
             solv_col = info.get("solvent_col", "solvent_smiles")
 
             df = pd.read_csv(path, low_memory=False)
-            csv_sample_counts[path] = len(df)
 
             # kind 라벨
             df["data_kind"] = kind
 
-            # 공통 컬럼 이름 만들기
+            # (1) type 컬럼이 원래 있는 DB면 정리 + max_nm 통일
+            if "type" in df.columns:
+                df["type"] = df["type"].apply(lambda x: str(x).strip().upper() if pd.notna(x) else "")
+
+                if "max_nm" not in df.columns:
+                    if "Absorption max (nm)" in df.columns and "Emission max (nm)" in df.columns:
+                        abs_v = pd.to_numeric(df["Absorption max (nm)"], errors="coerce")
+                        em_v = pd.to_numeric(df["Emission max (nm)"], errors="coerce")
+                        df["max_nm"] = np.where(df["type"].values == "AB", abs_v, em_v)
+                    elif "Absorption max (nm)" in df.columns:
+                        df["max_nm"] = pd.to_numeric(df["Absorption max (nm)"], errors="coerce")
+                    elif "Emission max (nm)" in df.columns:
+                        df["max_nm"] = pd.to_numeric(df["Emission max (nm)"], errors="coerce")
+
+            # (2) chromophore DB면 row 2배 확장 + type/max_nm 생성
+            if kind == "chromo":
+                has_abs = "Absorption max (nm)" in df.columns
+                has_em = "Emission max (nm)" in df.columns
+
+                if has_abs and has_em:
+                    df_ab = df.copy()
+                    df_ab["type"] = "AB"
+                    df_ab["max_nm"] = pd.to_numeric(df_ab["Absorption max (nm)"], errors="coerce")
+
+                    df_em = df.copy()
+                    df_em["type"] = "EM"
+                    df_em["max_nm"] = pd.to_numeric(df_em["Emission max (nm)"], errors="coerce")
+
+                    df = pd.concat([df_ab, df_em], ignore_index=True)
+                else:
+                    # 둘 중 하나만 있으면 가능한 것만 생성
+                    if has_abs and "max_nm" not in df.columns:
+                        df["type"] = "AB"
+                        df["max_nm"] = pd.to_numeric(df["Absorption max (nm)"], errors="coerce")
+                    elif has_em and "max_nm" not in df.columns:
+                        df["type"] = "EM"
+                        df["max_nm"] = pd.to_numeric(df["Emission max (nm)"], errors="coerce")
+
+            # 공통 mol 컬럼 통일 (항상 마지막에)
             df[self.solute_mol_col] = df[mol_col]
             df[self.solvent_mol_col] = df[solv_col]
 
+            # 샘플 수 기록(확장 후 길이)
+            csv_sample_counts[path] = len(df)
+
+            # ✅ append는 딱 1번만
             frames.append(df)
 
         self.data = pd.concat(frames, ignore_index=True)
@@ -96,6 +137,8 @@ class MultiTaskSMILESDataset(UnifiedSMILESDataset):
             if col in self.data.columns:
                 if col == "Solvent":
                     self.data[col] = self.data[col].apply(_normalize_solvent_cell)
+                elif col.lower() == "type":
+                    self.data[col] = self.data[col].apply(lambda x: str(x).strip().upper() if pd.notna(x) else "")
                 else:
                     self.data[col] = self.data[col].apply(_normalize_token)
 
@@ -302,11 +345,9 @@ class MultiTaskSMILESDataset(UnifiedSMILESDataset):
         spec = np.zeros((N, len(nm_grid)), dtype=np.float32)
         spec_mask = np.zeros((N,), dtype=bool)
 
-        lam_abs = np.zeros((N,), dtype=np.float32)
-        lam_abs_mask = np.zeros((N,), dtype=bool)
-
-        lam_emi = np.zeros((N,), dtype=np.float32)
-        lam_emi_mask = np.zeros((N,), dtype=bool)
+        # (변경) lam_abs / lam_emi 삭제하고 max_nm 하나로
+        max_nm = np.zeros((N,), dtype=np.float32)
+        max_nm_mask = np.zeros((N,), dtype=bool)
 
         qy = np.zeros((N,), dtype=np.float32)
         qy_mask = np.zeros((N,), dtype=bool)
@@ -336,67 +377,55 @@ class MultiTaskSMILESDataset(UnifiedSMILESDataset):
                     tmp[mask] = (vals - r_min) / r_range
                     normed.append(tmp)
             normed = np.stack(normed)
+
             spec[full_idx, : normed.shape[1]] = normed
             spec_mask[full_idx] = True
 
-            # λmax (emission 기준; ABS 따로 있으면 ABS도 가능)
+            # (변경) 기존 lam_emi -> max_nm
             idx_max = normed.argmax(axis=1)
-            lam_emi[full_idx] = nm_grid[idx_max]
-            lam_emi_mask[full_idx] = True
+            max_nm[full_idx] = nm_grid[idx_max]
+            max_nm_mask[full_idx] = True
 
-        # --- chromophore 데이터 처리: Abs/Em λmax, QY, Lifetime ---
+        # --- chromophore 데이터 처리: 이제는 max_nm 컬럼을 직접 사용 ---
         chromo_idx = kind_series == "chromo"
         if chromo_idx.any():
-            if "Absorption max (nm)" in self.data.columns:
-                vals = pd.to_numeric(
-                    self.data.loc[chromo_idx, "Absorption max (nm)"],
-                    errors="coerce",
-                )
+            # (핵심) df를 만들 때 이미 chromo를 2배로 확장했고 max_nm/type이 생겼다는 전제
+            if "max_nm" in self.data.columns:
+                vals = pd.to_numeric(self.data.loc[chromo_idx, "max_nm"], errors="coerce")
                 mask_valid = vals.notna()
-                lam_abs[chromo_idx] = vals.fillna(0).values
-                lam_abs_mask[chromo_idx] = mask_valid.values
+                max_nm[chromo_idx] = vals.fillna(0).values
+                max_nm_mask[chromo_idx] = mask_valid.values
 
-            if "Emission max (nm)" in self.data.columns:
-                vals = pd.to_numeric(
-                    self.data.loc[chromo_idx, "Emission max (nm)"],
-                    errors="coerce",
-                )
-                mask_valid = vals.notna()
-                lam_emi[chromo_idx] = vals.fillna(0).values
-                lam_emi_mask[chromo_idx] = mask_valid.values
+            # qy / life는 보통 EM에서만 유효하니 type==EM 마스킹
+            if "type" in self.data.columns:
+                is_em_chromo = (self.data.loc[chromo_idx, "type"].astype(str).str.upper() == "EM").values
+            else:
+                is_em_chromo = np.ones(chromo_idx.sum(), dtype=bool)
 
             if "Quantum yield" in self.data.columns:
-                vals = pd.to_numeric(
-                    self.data.loc[chromo_idx, "Quantum yield"],
-                    errors="coerce",
-                )
-                mask_valid = vals.notna()
+                vals = pd.to_numeric(self.data.loc[chromo_idx, "Quantum yield"], errors="coerce")
+                mask_valid = vals.notna().values & is_em_chromo
                 qy[chromo_idx] = vals.fillna(0).values
-                qy_mask[chromo_idx] = mask_valid.values
+                qy_mask[chromo_idx] = mask_valid
 
             if "Lifetime (ns)" in self.data.columns:
-                vals = pd.to_numeric(
-                    self.data.loc[chromo_idx, "Lifetime (ns)"],
-                    errors="coerce",
-                )
-                mask_valid = vals.notna()
+                vals = pd.to_numeric(self.data.loc[chromo_idx, "Lifetime (ns)"], errors="coerce")
+                mask_valid = vals.notna().values & is_em_chromo
                 life[chromo_idx] = vals.fillna(0).values
-                life_mask[chromo_idx] = mask_valid.values
+                life_mask[chromo_idx] = mask_valid
 
         # torch로 저장
         self.targets = {
             "spectrum": torch.tensor(spec, dtype=torch.float32),
-            "lam_abs":  torch.tensor(lam_abs, dtype=torch.float32).unsqueeze(-1),
-            "lam_emi":  torch.tensor(lam_emi, dtype=torch.float32).unsqueeze(-1),
-            "qy":       torch.tensor(qy, dtype=torch.float32).unsqueeze(-1),
-            "life":     torch.tensor(life, dtype=torch.float32).unsqueeze(-1),
+            "max_nm": torch.tensor(max_nm, dtype=torch.float32).unsqueeze(-1),
+            "qy": torch.tensor(qy, dtype=torch.float32).unsqueeze(-1),
+            "life": torch.tensor(life, dtype=torch.float32).unsqueeze(-1),
         }
         self.target_masks = {
             "spectrum": torch.tensor(spec_mask, dtype=torch.bool),
-            "lam_abs":  torch.tensor(lam_abs_mask, dtype=torch.bool),
-            "lam_emi":  torch.tensor(lam_emi_mask, dtype=torch.bool),
-            "qy":       torch.tensor(qy_mask, dtype=torch.bool),
-            "life":     torch.tensor(life_mask, dtype=torch.bool),
+            "max_nm": torch.tensor(max_nm_mask, dtype=torch.bool),
+            "qy": torch.tensor(qy_mask, dtype=torch.bool),
+            "life": torch.tensor(life_mask, dtype=torch.bool),
         }
 
     # ---------- Dataset API (getitem / len) ----------
@@ -881,7 +910,7 @@ if __name__ == "__main__":
         mol_col="smiles",                # 여기서는 solute 컬럼 이름만 맞추면 됨
         target_type="exp_spectrum",
         intensity_range=(200, 800),
-        global_feature_order=["pH_label"],
+        global_feature_order=["pH_label", "type"], #
         global_multihot_cols={},
         continuous_feature_names=[],
     )
