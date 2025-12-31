@@ -64,8 +64,8 @@ def add_solvent_smiles(db_csv_path, solvent_smiles_csv_path, save_path):
 
 
 if __name__ == "__main__":
-    DB_CSV   = r"QM_stratified_train_resplit_with_mu_eps.csv"
+    DB_CSV   = r"EM_stratified_test_clustered_resplit_with_mu_eps_fillZero.csv"
     SOLV_CSV = r"solvent_smiles.csv"
-    SAVE_CSV = r"QM_with_solvent_smiles_train.csv"
+    SAVE_CSV = r"EM_with_solvent_smiles_test.csv"
 
     add_solvent_smiles(DB_CSV, SOLV_CSV, SAVE_CSV)

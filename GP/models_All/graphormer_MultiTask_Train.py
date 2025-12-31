@@ -122,6 +122,46 @@ def build_softdtw(device, gamma=1.0, normalize=True, bandwidth=None):
     return SoftDTW(use_cuda=use_cuda, gamma=gamma, normalize=normalize, bandwidth=bandwidth)
 
 @torch.no_grad()
+def softdtw_sample_mean(
+    softdtw_fn: SoftDTW,
+    yh: torch.Tensor,  # (Bv, L, 1)
+    yt: torch.Tensor,  # (Bv, L, 1)
+) -> Tuple[torch.Tensor, int]:
+    """
+    SoftDTW를 '샘플 단위 평균'으로 안전하게 계산.
+    반환: (mean_value_tensor, n_samples_used)
+    - softdtw_fn가 (Bv,)를 주든 scalar를 주든 동일하게 처리.
+    """
+    if yh.size(0) == 0:
+        return yh.new_tensor(float("nan")), 0
+
+    dtw = softdtw_fn(yh, yt)
+
+    # case 1) scalar (이미 배치 평균인 경우가 많음)
+    if torch.is_tensor(dtw) and dtw.dim() == 0:
+        # scalar가 배치 평균이라고 가정하고, 샘플수로 가중평균 가능하게 sum로 환산
+        mean = dtw
+        return mean, int(yh.size(0))
+
+    # case 2) per-sample vector
+    dtw_vec = dtw.view(-1)  # (Bv,) or (Bv*something,)
+    # 혹시 (Bv,)보다 길게 나오면(드물지만) Bv로 reshape 가능한 경우만 처리
+    Bv = yh.size(0)
+    if dtw_vec.numel() != Bv:
+        # 최후의 보루: 샘플별 값이 아니라면 그냥 mean으로 취급(그래도 가중평균은 가능)
+        mean = dtw_vec.mean()
+        return mean, Bv
+
+    # finite 샘플만 평균
+    v = dtw_vec
+    m = torch.isfinite(v)
+    if not m.any():
+        return yh.new_tensor(float("nan")), 0
+
+    return v[m].mean(), int(m.sum().item())
+
+
+@torch.no_grad()
 def compute_sid_scalar(
     yhat: torch.Tensor,  # (B,L)
     y: torch.Tensor,     # (B,L)
@@ -373,7 +413,8 @@ def compute_metrics_one_epoch(
     spec_sid_n = 0
     spec_softdtw_sum = 0.0
     spec_softdtw_n = 0
-
+    spec_sis_sum = 0.0
+    spec_sis_n = 0
     # ---------- Point tasks accum ----------
     point_tasks = ["max_nm", "life", "qy"]
     pt = {k: {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "y_sum": 0.0, "y2_sum": 0.0, "res2_sum": 0.0}
@@ -402,21 +443,45 @@ def compute_metrics_one_epoch(
                 spec_sq_sum += float((e * e).sum().item())
                 spec_cnt += int(e.numel())
 
-                # SID (mask 포함 scalar)
-                sid_v = compute_sid_scalar(yhat, y, mB)
-                if torch.isfinite(sid_v):
-                    spec_sid_sum += float(sid_v.item())
-                    spec_sid_n += 1
+                # ---------- per-sample SID vector ----------
+                mBL = torch.isfinite(y) & torch.isfinite(yhat) & mB.unsqueeze(1)
+
+                loss_BL = sid_loss(
+                    model_spectra=yhat,
+                    target_spectra=y,
+                    mask=mBL,
+                    reduction="none",  # (B, L) or (B,L,...) depending on your sid_loss impl
+                )
+
+                # per-sample mean over valid wavelength points
+                valid_counts = mBL.sum(dim=1).clamp_min(1)  # (B,)
+                sid_vec = (loss_BL * mBL).sum(dim=1) / valid_counts  # (B,)
+
+                # samples with zero valid points -> nan
+                sid_vec = torch.where(mBL.sum(dim=1) > 0, sid_vec, sid_vec.new_tensor(float("nan")))
+
+                # ---------- SID accum (sum/count) ----------
+                sid_valid = torch.isfinite(sid_vec)
+                if sid_valid.any():
+                    spec_sid_sum += float(sid_vec[sid_valid].sum().item())
+                    spec_sid_n += int(sid_valid.sum().item())
+
+                # ---------- SIS accum (sum/count) ----------
+                sis_vec = 1.0 / (1.0 + sid_vec.clamp_min(0.0) + 1e-12)
+                sis_valid = torch.isfinite(sis_vec)
+                if sis_valid.any():
+                    spec_sis_sum += float(sis_vec[sis_valid].sum().item())
+                    spec_sis_n += int(sis_valid.sum().item())
 
                 # SoftDTW (scalar)
                 if softdtw_fn is not None:
                     yh = torch.nan_to_num(yhat, nan=0.0, posinf=0.0, neginf=0.0)[mB].unsqueeze(-1)
-                    yt = torch.nan_to_num(y,    nan=0.0, posinf=0.0, neginf=0.0)[mB].unsqueeze(-1)
-                    if yh.size(0) > 0:
-                        dtw_v = softdtw_fn(yh, yt).mean()
-                        if torch.isfinite(dtw_v):
-                            spec_softdtw_sum += float(dtw_v.item())
-                            spec_softdtw_n += 1
+                    yt = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)[mB].unsqueeze(-1)
+
+                    dtw_mean, n_used = softdtw_sample_mean(softdtw_fn, yh, yt)
+                    if (n_used > 0) and torch.isfinite(dtw_mean):
+                        spec_softdtw_sum += float(dtw_mean.item()) * n_used  # ✅ 가중합
+                        spec_softdtw_n += int(n_used)  # ✅ 샘플 수
 
         # ===== Point metrics =====
         for k in point_tasks:
@@ -452,7 +517,7 @@ def compute_metrics_one_epoch(
     sid_mean = (spec_sid_sum / spec_sid_n) if spec_sid_n > 0 else float("nan")
     out[prefix + "spectrum_sid"] = sid_mean
     out[prefix + "spectrum_softdtw"] = (spec_softdtw_sum / spec_softdtw_n) if spec_softdtw_n > 0 else float("nan")
-    out[prefix + "spectrum_sis"] = (1.0 / (1.0 + sid_mean + 1e-12)) if math.isfinite(sid_mean) else float("nan")
+    out[prefix + "spectrum_sis"] = (spec_sis_sum / spec_sis_n) if spec_sis_n > 0 else float("nan")
 
     # ----- point finalize -----
     for k in point_tasks:
@@ -525,17 +590,27 @@ def compute_multitask_loss(
                     if softdtw_fn is None:
                         raise RuntimeError("SOFTDTW requested but softdtw_fn is None")
 
-                    yh = torch.nan_to_num(yhat, nan=0.0, posinf=0.0, neginf=0.0)
-                    yt = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+                    yh = torch.nan_to_num(yhat, nan=0.0, posinf=0.0, neginf=0.0)[mB].unsqueeze(-1)
+                    yt = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)[mB].unsqueeze(-1)
 
-                    # sample mask만 적용 (Bv, L, 1)
-                    yh = yh[mB].unsqueeze(-1)
-                    yt = yt[mB].unsqueeze(-1)
+                    # (Bv,L,1) -> per-sample vector가 나오든 scalar가 나오든 처리
+                    dtw = softdtw_fn(yh, yt)  # 기대: (Bv,) or (Bv,1) or scalar
 
-                    if yh.size(0) == 0:
+                    # per-sample vector로 맞추기
+                    if dtw.dim() == 0:
+                        # 이미 scalar면 그대로
+                        dtw_mean = dtw
+                        n_used = int(yh.size(0))
+                    else:
+                        dtw_vec = dtw.view(dtw.size(0), -1).mean(dim=1)  # (Bv,)
+                        valid = torch.isfinite(dtw_vec)
+                        n_used = int(valid.sum().item())
+                        dtw_mean = dtw_vec[valid].mean() if n_used > 0 else dtw_vec.new_tensor(float("nan"))
+
+                    if (n_used == 0) or (not torch.isfinite(dtw_mean)):
                         ls = yhat.new_tensor(0.0)
                     else:
-                        ls = softdtw_fn(yh, yt).mean()
+                        ls = dtw_mean
 
                 else:
                     per_elem = fn(yhat, y)  # (B,L)
@@ -770,6 +845,8 @@ def eval_one_epoch(
     spec_sid_n = 0
     spec_softdtw_sum = 0.0
     spec_softdtw_n = 0
+    spec_sis_sum = 0.0
+    spec_sis_n = 0
 
     # -------------------------
     # (B) Point metrics accum (R2/MAE/RMSE를 “전체 데이터 기준”으로)
@@ -813,21 +890,45 @@ def eval_one_epoch(
                 spec_sq_sum += float((e * e).sum().item())
                 spec_cnt += int(e.numel())
 
-                # SID (배치 scalar 평균 누적)
-                sid_v = compute_sid_scalar(yhat, y, mB)  # scalar
-                if torch.isfinite(sid_v):
-                    spec_sid_sum += float(sid_v.item())
-                    spec_sid_n += 1
+                # ---------- per-sample SID vector ----------
+                mBL = torch.isfinite(y) & torch.isfinite(yhat) & mB.unsqueeze(1)
+
+                loss_BL = sid_loss(
+                    model_spectra=yhat,
+                    target_spectra=y,
+                    mask=mBL,
+                    reduction="none",  # (B, L) or (B,L,...) depending on your sid_loss impl
+                )
+
+                # per-sample mean over valid wavelength points
+                valid_counts = mBL.sum(dim=1).clamp_min(1)  # (B,)
+                sid_vec = (loss_BL * mBL).sum(dim=1) / valid_counts  # (B,)
+
+                # samples with zero valid points -> nan
+                sid_vec = torch.where(mBL.sum(dim=1) > 0, sid_vec, sid_vec.new_tensor(float("nan")))
+
+                # ---------- SID accum (sum/count) ----------
+                sid_valid = torch.isfinite(sid_vec)
+                if sid_valid.any():
+                    spec_sid_sum += float(sid_vec[sid_valid].sum().item())
+                    spec_sid_n += int(sid_valid.sum().item())
+
+                # ---------- SIS accum (sum/count) ----------
+                sis_vec = 1.0 / (1.0 + sid_vec.clamp_min(0.0) + 1e-12)
+                sis_valid = torch.isfinite(sis_vec)
+                if sis_valid.any():
+                    spec_sis_sum += float(sis_vec[sis_valid].sum().item())
+                    spec_sis_n += int(sis_valid.sum().item())
 
                 # SoftDTW (배치 scalar 평균 누적)
                 if softdtw_fn is not None:
                     yh = torch.nan_to_num(yhat, nan=0.0, posinf=0.0, neginf=0.0)[mB].unsqueeze(-1)
                     yt = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)[mB].unsqueeze(-1)
-                    if yh.size(0) > 0:
-                        dtw_v = softdtw_fn(yh, yt).mean()
-                        if torch.isfinite(dtw_v):
-                            spec_softdtw_sum += float(dtw_v.item())
-                            spec_softdtw_n += 1
+
+                    dtw_mean, n_used = softdtw_sample_mean(softdtw_fn, yh, yt)
+                    if (n_used > 0) and torch.isfinite(dtw_mean):
+                        spec_softdtw_sum += float(dtw_mean.item()) * n_used
+                        spec_softdtw_n += int(n_used)
 
         # ---------- 3) Point metrics (R2/MAE/RMSE) ----------
         for k in point_tasks:
@@ -871,7 +972,7 @@ def eval_one_epoch(
     sum_logs["spectrum_sid"] = (spec_sid_sum / spec_sid_n) if spec_sid_n > 0 else float("nan")
     sum_logs["spectrum_softdtw"] = (spec_softdtw_sum / spec_softdtw_n) if spec_softdtw_n > 0 else float("nan")
     # (원하면) SIS도 여기서 계산 가능: SIS = 1/(1+SID)
-    sum_logs["spectrum_sis"] = (1.0 / (1.0 + sum_logs["spectrum_sid"] + 1e-12)) if math.isfinite(sum_logs["spectrum_sid"]) else float("nan")
+    sum_logs["spectrum_sis"] = (spec_sis_sum / spec_sis_n) if spec_sis_n > 0 else float("nan")
 
     # -------------------------
     # (E) Point metrics finalize
@@ -1127,8 +1228,10 @@ def run_train_multitask(
         "train_loss_max_nm",
         "train_loss_life",
         "train_loss_qy",
+        "train_loss_peak_consistency",
         "train_raw_total",
         "train_raw_spectrum",
+        "train_raw_peak_consistency",
         "sec_train",
     ]
 
@@ -1198,18 +1301,6 @@ def run_train_multitask(
 
         metrics_softdtw = softdtw_metric_fn if cfg.metrics_compute_softdtw else None
 
-        m_tr = compute_metrics_one_epoch(
-            model=model, loader=train_loader, device=device,
-            softdtw_fn=metrics_softdtw,
-            prefix="train_metric_",
-        )
-
-        m_va = compute_metrics_one_epoch(
-            model=model, loader=val_loader, device=device,
-            softdtw_fn=metrics_softdtw,
-            prefix="val_metric_",
-        )
-
         # loss.csv 저장 (항상)
         loss_row = {
             "epoch": epoch,
@@ -1218,8 +1309,10 @@ def run_train_multitask(
             "train_loss_max_nm": tr.get("loss_max_nm", 'nan'),
             "train_loss_life": tr.get("loss_life", float("nan")),
             "train_loss_qy": tr.get("loss_qy", float("nan")),
+            "train_loss_peak_consistency": tr.get("loss_peak_consistency", float("nan")),
             "train_raw_total": tr.get("raw_total", float("nan")),
             "train_raw_spectrum": tr.get("raw_spectrum", float("nan")),
+            "train_raw_peak_consistency": tr.get("raw_peak_consistency", float("nan")),
             "sec_train": tr.get("sec", 0.0),
         }
 
@@ -1285,7 +1378,7 @@ def run_train_multitask(
 
         # loss_fns_spec keys는 "MAE","SID","SOFTDTW" 같은 것들
         spec_keys = [f"loss_spectrum_{nm}" for nm in loss_fns_spec.keys()]  # ex) loss_spectrum_MAE, loss_spectrum_SID
-        prop_keys = ["loss_max_nm", "loss_life", "loss_qy"]
+        prop_keys = ["loss_max_nm", "loss_life", "loss_qy", "loss_peak_consistency"]
 
         spec_str = " ".join([f"{k.split('_')[-1]}={_fmt(tr.get(k, float('nan')))}" for k in spec_keys])
         prop_str = " ".join([f"{k.split('_', 1)[1]}={_fmt(tr.get(k, float('nan')))}" for k in prop_keys])
@@ -1346,13 +1439,19 @@ if __name__ == "__main__":
     # }
     train_csv_info_list = [
         {
-            "path": r"C:/Users/kogun/PycharmProjects/Graphormer_UV_VIS_Fluorescence_v2/Data/EM_with_solvent_smiles_test_sample100.csv",
+            "path": r"C:\Users\analcheminfo\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\ABS_with_solvent_smiles_train.csv_100row",
             "kind": "full",
             "mol_col": "InChI",
             "solvent_col": "solvent_smiles",
         },
         {
-            "path": r"C:/Users/kogun/PycharmProjects/Graphormer_UV_VIS_Fluorescence_v2/Data/DB for chromophore_Sci_Data_rev02_sample100.csv",
+            "path": r"C:\Users\analcheminfo\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\EM_with_solvent_smiles_train.csv_100row",
+            "kind": "full",
+            "mol_col": "InChI",
+            "solvent_col": "solvent_smiles",
+        },
+        {
+            "path": r"C:\Users\analcheminfo\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\DB for chromophore_Sci_Data_rev02.csv_100row",
             "kind": "chromo",
             "mol_col": "Chromophore",
             "solvent_col": "Solvent",
@@ -1361,13 +1460,19 @@ if __name__ == "__main__":
 
     val_csv_info_list = [
         {
-            "path": r"C:/Users/kogun/PycharmProjects/Graphormer_UV_VIS_Fluorescence_v2/Data/EM_with_solvent_smiles_test_sample100.csv",
+            "path": r"C:\Users\analcheminfo\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\ABS_with_solvent_smiles_test.csv_100row",
             "kind": "full",
             "mol_col": "InChI",
             "solvent_col": "solvent_smiles",
         },
         {
-            "path": r"C:/Users/kogun/PycharmProjects/Graphormer_UV_VIS_Fluorescence_v2/Data/DB for chromophore_Sci_Data_rev02_sample100.csv",
+            "path": r"C:\Users\analcheminfo\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\EM_with_solvent_smiles_test.csv_100row",
+            "kind": "full",
+            "mol_col": "InChI",
+            "solvent_col": "solvent_smiles",
+        },
+        {
+            "path": r"C:\Users\analcheminfo\PycharmProjects\Graphormer_UV_VIS_Fluorescence_v2\Data\DB for chromophore_Sci_Data_rev02.csv_100row",
             "kind": "chromo",
             "mol_col": "Chromophore",
             "solvent_col": "Solvent",
